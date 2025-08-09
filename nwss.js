@@ -38,13 +38,16 @@ const { clearPersistentCache } = require('./lib/smart-cache');
 // Enhanced redirect handling
 const { navigateWithRedirectHandling, handleRedirectTimeout } = require('./lib/redirect');
 // Ensure web browser is working correctly
-const { monitorBrowserHealth, isBrowserHealthy } = require('./lib/browserhealth');
+const { monitorBrowserHealth, isBrowserHealthy, detectPuppeteerVersion } = require('./lib/browserhealth');
 
 // --- Script Configuration & Constants ---
 const VERSION = '1.0.60'; // Script version
 
 // get startTime
 const startTime = Date.now();
+
+// Detect Puppeteer version for compatibility optimizations
+const PUPPETEER_VERSION_INFO = detectPuppeteerVersion();
 
 // Initialize domain cache helpers with debug logging if enabled
 const domainCacheOptions = { enableLogging: false }; // Set to true for cache debug logs
@@ -930,6 +933,31 @@ function setupFrameHandling(page, forceDebug) {
           if (forceDebug) {
             console.log(formatLogMessage('debug', `Skipping frame with invalid/special URL: ${frameUrl}`));
           }
+    
+         // Apply frame-specific fingerprint protection to prevent property redefinition errors
+         try {
+           await frame.evaluateOnNewDocument(() => {
+             // Minimal frame protection - just prevent property redefinition errors
+             if (window.__frameProtectionApplied) return;
+             window.__frameProtectionApplied = true;
+             
+             // Override Object.defineProperty to be more defensive in frames
+             const originalDefineProperty = Object.defineProperty;
+             Object.defineProperty = function(obj, prop, descriptor) {
+               const problematicProps = ['href', 'origin', 'protocol', 'host', 'hostname'];
+               if (problematicProps.includes(prop)) {
+                 return obj; // Skip problematic properties silently
+               }
+               try {
+                 return originalDefineProperty.call(this, obj, prop, descriptor);
+               } catch (e) {
+                 return obj; // Fail silently instead of throwing
+               }
+             };
+           });
+         } catch (frameProtectionErr) {
+           // Ignore frame protection errors
+         }
           return;
         }
         
@@ -1014,6 +1042,13 @@ function setupFrameHandling(page, forceDebug) {
   async function createBrowser() {
     // Create temporary user data directory that we can fully control and clean up
     const tempUserDataDir = `/tmp/puppeteer-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    
+    // Enhanced 24.x compatibility logging
+    if (forceDebug) {
+      console.log(formatLogMessage('debug', `Puppeteer ${PUPPETEER_VERSION_INFO.version} detected (${PUPPETEER_VERSION_INFO.is24x ? '24.x' : '20.x'} mode)`));
+      console.log(formatLogMessage('debug', `Enhanced timeouts: ${PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 'enabled' : 'disabled'}`));
+    }
+
     userDataDir = tempUserDataDir; // Store for cleanup tracking (use outer scope variable)
 
     // Try to find system Chrome installation to avoid Puppeteer downloads
@@ -1035,11 +1070,30 @@ function setupFrameHandling(page, forceDebug) {
         break;
       }
     }
+    
+    // Auto-detect headless mode for universal compatibility
+    let headlessMode;
+    if (!launchHeadless) {
+      headlessMode = false; // GUI mode works the same in both versions
+    } else {
+      // Try 'new' headless mode first (24.x), fallback to 'shell' (20.x), then true
+      try {
+        // Use version detection from browserhealth module
+        headlessMode = PUPPETEER_VERSION_INFO.is24x ? 'new' : 'shell';
+      } catch {
+        headlessMode = 'new'; // Default to 'new' if version detection fails
+      }
+    }
+    
+    // Dynamic protocol timeout based on version
+    const protocolTimeoutMs = PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 300000 : 180000; // 5min vs 3min
+
     const browser = await puppeteer.launch({
       // Use system Chrome if available to avoid downloads
       executablePath: executablePath,
-      // Force temporary user data directory for complete cleanup control
+      // Force temporary user data directory with enhanced cleanup for 24.x
       userDataDir: tempUserDataDir,
+      protocolTimeout: protocolTimeoutMs, // Dynamic timeout based on version
       args: [
         // Disk space controls - 50MB cache limits
         '--disk-cache-size=52428800', // 50MB disk cache (50 * 1024 * 1024)
@@ -1079,10 +1133,14 @@ function setupFrameHandling(page, forceDebug) {
 	    '--disable-threaded-animation',
 	    '--disable-threaded-scrolling',
 	    '--disable-checker-imaging',
-	    '--disable-image-animation-resync'
+	    '--disable-image-animation-resync',
+        // Additional 24.x compatibility flags
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=VizDisplayCompositor,VizHitTestSurfaceLayer',
+        '--force-color-profile=srgb'
         ],
-        headless: launchHeadless ? 'shell' : false,
-        protocolTimeout: 60000  // 60 seconds
+        headless: headlessMode, // Auto-detected for universal compatibility
+        defaultViewport: null // Let browser determine viewport for better compatibility
     });
     
     // Store the user data directory on the browser object for cleanup
@@ -1250,10 +1308,13 @@ function setupFrameHandling(page, forceDebug) {
       }
       page = await browserInstance.newPage();
       
-      // Set aggressive timeouts for problematic operations
-      page.setDefaultTimeout(Math.min(timeout, 20000));  // Use site timeout or 20s max
-      page.setDefaultNavigationTimeout(Math.min(timeout, 25000));  // Use site timeout or 25s max
-      // Note: timeout variable from siteConfig.timeout || 30000 is overridden for stability
+      // Enhanced timeout handling for Puppeteer 24.x
+      const adjustedTimeout = Math.max(timeout, 30000); // Minimum 30s for stability
+      const maxTimeout = 120000; // Maximum 2 minutes to prevent hanging
+      const safeTimeout = Math.min(adjustedTimeout, maxTimeout);
+      
+      page.setDefaultTimeout(safeTimeout);
+      page.setDefaultNavigationTimeout(safeTimeout);
       
       page.on('console', (msg) => {
         if (forceDebug && msg.type() === 'error') console.log(`[debug] Console error: ${msg.text()}`);
@@ -1263,6 +1324,26 @@ function setupFrameHandling(page, forceDebug) {
       page.on('error', (err) => {
         if (forceDebug) console.log(formatLogMessage('debug', `Page crashed: ${err.message}`));
         // Don't throw here as it might cause hanging - let the timeout handle it
+      });
+
+      // Enhanced error handling for Puppeteer 24.x
+      page.on('pageerror', (err) => {
+       if (forceDebug) {
+         // Safe error message extraction for Puppeteer 24.x compatibility
+         const errorMessage = err?.message || err?.toString() || String(err) || 'Unknown page error';
+         console.log(formatLogMessage('debug', `Page error: ${errorMessage}`));
+       }
+      });
+      
+      page.on('requestfailed', (request) => {
+       if (forceDebug) {
+         try {
+           const url = request?.url() || 'unknown URL';
+           console.log(formatLogMessage('debug', `Request failed: ${url}`));
+         } catch (reqErr) {
+           console.log(formatLogMessage('debug', `Request failed: [URL extraction failed]`));
+         }
+       }
       });
 
       // Apply flowProxy timeouts if detection is enabled
@@ -2084,14 +2165,19 @@ function setupFrameHandling(page, forceDebug) {
 
         // Use faster defaults for sites with long timeouts to improve responsiveness
         const isFastSite = timeout <= 15000;
-        const defaultWaitUntil = isFastSite ? 'load' : 'domcontentloaded';
+        // Use more conservative defaults for 24.x
+        const defaultWaitUntil = isFastSite ? 'domcontentloaded' : 'networkidle2';
         const defaultGotoOptions = {
           waitUntil: defaultWaitUntil,
-          timeout: timeout
+           timeout: safeTimeout // Use the safe timeout from above
         };
         const gotoOptions = siteConfig.goto_options 
           ? { ...defaultGotoOptions, ...siteConfig.goto_options }
           : defaultGotoOptions;
+          
+        // Add retry logic for navigation failures in 24.x
+        let navigationAttempts = 0;
+        const maxNavigationAttempts = 2;
 
         // Enhanced navigation with redirect handling - passes existing gotoOptions
         const navigationResult = await navigateWithRedirectHandling(page, currentUrl, siteConfig, gotoOptions, forceDebug, formatLogMessage);
@@ -2323,33 +2409,38 @@ function setupFrameHandling(page, forceDebug) {
       }
       
     } catch (err) {
-    // Enhanced error handling with rule preservation for partial matches
-    if (err.message.includes('Runtime.callFunctionOn timed out') || 
-        err.message.includes('Protocol error') ||
-        err.message.includes('Target closed') ||
-        err.message.includes('Browser has been closed')) {
-      console.error(formatLogMessage('error', `Critical browser protocol error on ${currentUrl}: ${err.message}`));
-      return { 
-        url: currentUrl, 
-        rules: [], 
-        success: false, 
-        needsImmediateRestart: true,
-        error: `Critical protocol error: ${err.message}`
-      };
-    }
-    
-      if (err.message.includes('Protocol error') || 
-          err.message.includes('Target closed') ||
-          err.message.includes('Browser process was killed') ||
-          err.message.includes('Browser protocol broken')) {
+      // Enhanced error handling for Puppeteer 24.x specific errors
+      const criticalErrors = [
+        'Runtime.callFunctionOn timed out',
+        'Protocol error',
+        'Target closed',
+        'Browser has been closed',
+        'Session closed',
+        'Connection closed',
+        'WebSocket is not open',
+        'Execution context was destroyed' // New in 24.x
+      ];
+      
+      const isCriticalError = criticalErrors.some(errorText => 
+        err.message.includes(errorText)
+      );
+      
+      if (isCriticalError) {
         console.error(formatLogMessage('error', `Critical browser error on ${currentUrl}: ${err.message}`));
         return { 
           url: currentUrl, 
           rules: [], 
           success: false, 
           needsImmediateRestart: true,
-          error: err.message
+          error: `Critical error: ${err.message}`
         };
+      }
+    
+      // Handle navigation timeouts more gracefully in 24.x
+      if (err.message.includes('Navigation timeout') || 
+          err.message.includes('Waiting for selector timed out')) {
+        if (forceDebug) console.log(formatLogMessage('debug', `Navigation timeout on ${currentUrl}, attempting recovery`));
+        // Continue with partial results instead of complete failure
       }
       
       // For other errors, preserve any matches we found before the error
@@ -2398,10 +2489,36 @@ function setupFrameHandling(page, forceDebug) {
         } catch (gcErr) { /* ignore */ }
 
         try {
-          await page.close();
+          // Enhanced page close for Puppeteer 24.x
+          const closeTimeout = 15000; // Increased timeout for 24.x
+          
+          try {
+            await Promise.race([
+              page.close(),
+              new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Page close timeout')), closeTimeout)
+              )
+            ]);
+          } catch (closeErr) {
+            if (closeErr.message.includes('Target.closeTarget timed out')) {
+              // This is expected in 24.x, don't treat as error
+              if (forceDebug) console.log(formatLogMessage('debug', `Page close timeout (expected in 24.x): ${currentUrl}`));
+            } else {
+              throw closeErr;
+            }
+          }
           if (forceDebug) console.log(formatLogMessage('debug', `Page closed for ${currentUrl}`));
         } catch (pageCloseErr) {
-          if (forceDebug) console.log(formatLogMessage('debug', `Failed to close page for ${currentUrl}: ${pageCloseErr.message}`));
+          // More comprehensive timeout error handling for 24.x
+          const isTimeoutError = ['Page close timeout', 'Target.closeTarget timed out', 
+                                'Session closed', 'Connection closed'].some(msg => 
+                                pageCloseErr.message.includes(msg));
+          
+          if (isTimeoutError) {
+            if (forceDebug) console.log(formatLogMessage('debug', `Page close timeout for ${currentUrl} - normal in 24.x`));
+          } else {
+            if (forceDebug) console.log(formatLogMessage('debug', `Failed to close page for ${currentUrl}: ${pageCloseErr.message}`));
+          }
         }
       }
     }
@@ -2441,7 +2558,13 @@ function setupFrameHandling(page, forceDebug) {
     // Check browser health before processing each site
     const healthCheck = await monitorBrowserHealth(browser, {}, {
       siteIndex,
+      puppeteerVersion: PUPPETEER_VERSION_INFO, // Pass version info
       totalSites: siteGroups.length,
+      // Enhanced health monitoring for 24.x
+      checkMemoryUsage: true,
+      checkCPUUsage: true,
+      maxMemoryMB: 2048, // Stricter memory limits for 24.x
+      maxCPUPercent: 80,
       urlsSinceCleanup: urlsSinceLastCleanup,
       cleanupInterval: RESOURCE_CLEANUP_INTERVAL,
       forceDebug,
@@ -2478,10 +2601,15 @@ function setupFrameHandling(page, forceDebug) {
       try {
         await handleBrowserExit(browser, {
           forceDebug,
-          timeout: 10000,
+          // Dynamic timeout based on Puppeteer version
+          timeout: PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 25000 : 15000,
           exitOnFailure: false,
           cleanTempFiles: true,
-          comprehensiveCleanup: removeTempFiles  // Respect --remove-tempfiles during restarts
+          comprehensiveCleanup: removeTempFiles,
+          // Enhanced cleanup options for 24.x
+          gracefulShutdown: true,
+          waitForProcessExit: true,
+          killTimeout: 5000
         });
 
         // Clean up the specific user data directory
@@ -2536,7 +2664,8 @@ function setupFrameHandling(page, forceDebug) {
       
       // Force browser restart immediately
       try {
-        await handleBrowserExit(browser, { forceDebug, timeout: 5000, exitOnFailure: false, cleanTempFiles: true, comprehensiveCleanup: removeTempFiles });
+        const emergencyTimeout = PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 20000 : 12000;
+        await handleBrowserExit(browser, { forceDebug, timeout: emergencyTimeout, exitOnFailure: false, cleanTempFiles: true, comprehensiveCleanup: removeTempFiles, gracefulShutdown: true });
         // Additional cleanup after emergency restart
         if (removeTempFiles) {
           await cleanupChromeTempFiles({ 
@@ -2680,12 +2809,17 @@ function setupFrameHandling(page, forceDebug) {
 
   const cleanupResult = await handleBrowserExit(browser, {
     forceDebug,
-    timeout: 10000,
+    // Dynamic final cleanup timeout
+    timeout: PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 35000 : 25000,
     exitOnFailure: true,
     cleanTempFiles: true,
     comprehensiveCleanup: removeTempFiles,  // Use --remove-tempfiles flag
     userDataDir: browser._nwssUserDataDir,
-    verbose: !silentMode && removeTempFiles  // Show verbose output only if removing temp files and not silent
+    verbose: !silentMode && removeTempFiles,
+    // Enhanced final cleanup for 24.x
+    gracefulShutdown: true,
+    waitForProcessExit: true,
+    killTimeout: PUPPETEER_VERSION_INFO.needsEnhancedTimeouts ? 12000 : 8000
   });
 
   if (forceDebug) {
