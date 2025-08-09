@@ -1,0 +1,50 @@
+{
+  "name": "@fanboynz/network-scanner",
+  "version": "1.0.58",
+  "description": "A Puppeteer-based network scanner for analyzing web traffic, generating adblock filter rules, and identifying third-party requests. Features include fingerprint spoofing, Cloudflare bypass, content analysis with curl/grep, and multiple output formats.",
+  "main": "nwss.js",
+  "scripts": {
+    "start": "node nwss.js",
+    "scan": "node nwss.js",
+    "help": "node nwss.js --help",
+    "lint": "eslint *.js lib/*.js"
+  },
+  "dependencies": {
+    "lru-cache": "^10.4.3",
+    "p-limit": "^4.0.0",
+    "psl": "^1.15.0",
+    "puppeteer": "^23.11.1"
+  },
+  "keywords": [
+    "puppeteer",
+    "network-scanner",
+    "adblock",
+    "web-scraping",
+    "privacy",
+    "tracking-protection",
+    "filter-lists",
+    "fingerprint-spoofing",
+    "cloudflare-bypass",
+    "network-analysis"
+  ],
+  "author": "FanboyNZ",
+  "license": "GPL-3.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ryanbr/network-scanner"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/ryanbr/network-scanner/issues"
+  },
+  "homepage": "https://github.com/ryanbr/network-scanner",
+  "devDependencies": {
+    "eslint": "^9.32.0",
+    "globals": "^16.3.0"
+  }
+}
